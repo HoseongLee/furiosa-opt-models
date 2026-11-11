@@ -11,7 +11,7 @@ import numpy
 import numpy.typing
 import typing_extensions
 
-from . import decoder, llama, mistral, qwen3, vision_language
+from . import decoder, llama, mistral, qwen3, qwen3_moe, vision_language
 
 __all__ = [
     "Checkpoint",
@@ -29,6 +29,7 @@ __all__ = [
     "llama",
     "mistral",
     "qwen3",
+    "qwen3_moe",
     "vision_language",
 ]
 
