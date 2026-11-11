@@ -524,3 +524,4 @@ mod tests {
 }
 
 pub(crate) mod block;
+mod rows;
