@@ -16,8 +16,10 @@
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::ops::linear::experts::{Indices, Rows};
+use crate::ops::linear::fp8::rows::Band as BandOf;
 use crate::ops::pointwise::{activation::Silu, multiply::Multiply};
 use crate::ops::swiglu::GateUp;
+use crate::ops::swiglu::dispatch::{Dispatch, Thresholds};
 use crate::tensor::axis::Single;
 use crate::tensor::form::{BlockScaled, Part, fp8};
 use crate::tensor::live::Live;
@@ -153,6 +155,159 @@ impl<H: AxisName, I: AxisName, X: AxisName> Experts<H, I, X> {
     }
 }
 
+// The rows a band of the dispatch buffer runs through an expert at once.
+axes![Band = 16];
+
+/// The bands of `R` rows.
+#[derive(Clone, Debug)]
+struct Bands<R>(PhantomData<R>);
+
+impl<R: AxisName> AxisName for Bands<R> {
+    const NAME: Ident = Ident::new("Bands");
+    const SIZE: usize = {
+        assert!(R::SIZE.is_multiple_of(Band::SIZE));
+        R::SIZE / Band::SIZE
+    };
+}
+
+/// Every slot of the dispatch buffer: each expert's region of `R` rows.
+#[derive(Clone, Debug)]
+pub struct Slots<X, R>(PhantomData<(X, R)>);
+
+impl<X: AxisName, R: AxisName> AxisName for Slots<X, R> {
+    const NAME: Ident = Ident::new("Slots");
+    const SIZE: usize = X::SIZE * R::SIZE;
+}
+
+/// A dispatch buffer: every expert's region of `R` rows of `H` features, as bands.
+type Regions<X, R, H> = m![X, { Symbol<Bands<R>> }, Band, H];
+
+impl<H: AxisName, I: AxisName, X: AxisName> Experts<H, I, X> {
+    /// Each expert's selections of `dispatched`, which fill `bands_of` its bands, run through it
+    /// into the same rows of `computed`.
+    pub fn run<R: AxisName>(
+        &self,
+        device: &mut Device,
+        bands_of: &HbmTensor<i32, Chip, m![Thresholds, 1 # 2]>,
+        dispatched: &HbmTensor<bf16, Chip, m![{ Symbol<Slots<X, R>> }, H]>,
+        computed: &mut HbmTensor<bf16, Chip, m![{ Symbol<Slots<X, R>> }, H]>,
+    ) {
+        type Bs<R> = Symbol<Bands<R>>;
+        // SAFETY: each region's rows in order are its bands' rows in order.
+        let bands = unsafe { dispatched.view().reshape::<Chip, Regions<X, R, H>>() };
+        for expert in 0..X::SIZE {
+            let mut trips: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
+            bands_of
+                .view()
+                .tile::<m![{ Symbol<Thresholds> }], 1, m![
+                    { Symbol<Thresholds> } = 1 # ({ Symbol<Thresholds> }), 1 # 2
+                ]>(expert)
+                .to_hbm_view(&mut device.tdma, trips.view_mut());
+            let filled = trips.extent::<m![{ Bs<R> }]>();
+            // An expert runs the bands its selections fill, at most its region's.
+            for band in 0..filled {
+                let mut rows: HbmTensor<bf16, Chip, m![Band, H]> = HbmTensor::new();
+                bands
+                    .tile::<m![X], 1, m![X = 1 # X, { Bs<R> }, Band, H]>(expert)
+                    .tile::<m![{ Bs<R> }], 1, m![X = 1 # X, { Bs<R> } = 1 # ({ Bs<R> }), Band, H]>(
+                        band,
+                    )
+                    .to_hbm_view(&mut device.tdma, rows.view_mut());
+                let gate_up =
+                    Op::forward(&self.gate_up.expert(expert), &mut *device, BandOf(&rows));
+                // SAFETY: each row's packed features are its gate's, then its up projection's.
+                let gate_up: HbmTensor<bf16, Chip, m![Band, Term, I]> =
+                    unsafe { gate_up.reshape() };
+                let half = |device: &mut Device, term: usize| {
+                    let mut half: HbmTensor<bf16, Chip, m![Band, I]> = HbmTensor::new();
+                    gate_up
+                        .view()
+                        .tile::<m![Term], 1, m![Band, Term = 1 # Term, I]>(term)
+                        .to_hbm_view(&mut device.tdma, half.view_mut());
+                    half
+                };
+                let (gate, up) = (half(&mut *device, 0), half(&mut *device, 1));
+                let gate = Silu.forward(&mut *device, &gate);
+                let product = Multiply.forward(&mut *device, (&gate, &up));
+                let routed = Op::forward(
+                    &self.down_proj.expert(expert),
+                    &mut *device,
+                    BandOf(&product),
+                );
+                // SAFETY: as above, for the computed rows.
+                let out = unsafe { computed.view_mut().reshape::<Chip, Regions<X, R, H>>() };
+                routed.view().to_hbm_view(
+                    &mut device.tdma,
+                    out.tile::<m![X], 1, m![X = 1 #{!} X, { Bs<R> }, Band, H]>(expert)
+                        .tile::<m![{ Bs<R> }], 1, m![
+                            X = 1 #{!} X, { Bs<R> } = 1 #{!} ({ Bs<R> }), Band, H
+                        ]>(band),
+                );
+            }
+        }
+    }
+
+    /// [`Self::forward`]'s rows, grouped: the live rows' selections ordered by expert on the
+    /// device, each expert's run through it in bands of [`Band`] rows, and the outputs back in
+    /// order.
+    pub fn grouped<R: AxisName, K: AxisName>(
+        &self,
+        device: &mut Device,
+        (input, indices, live): (
+            &HbmTensor<bf16, Chip, m![R, H]>,
+            &Indices<R, K>,
+            Live<(), R>,
+        ),
+        dispatch: &Dispatch<R, K, X>,
+        output: &mut Rows<R, K, H>,
+    ) {
+        type S<X, R> = Symbol<Slots<X, R>>;
+        let plan = dispatch.plan(&mut *device, indices, live, 2 * H::SIZE);
+        let mut dispatched = HbmTensor::<bf16, Chip, m![{ S<X, R> }, H]>::new();
+        let mut computed = HbmTensor::<bf16, Chip, m![{ S<X, R> }, H]>::new();
+        // A row's offsets: an index list of its own.
+        let slots = |device: &mut Device, r: usize| {
+            let mut slots: HbmTensor<i32, Chip, m![K]> = HbmTensor::new();
+            plan.offsets
+                .view()
+                .tile::<m![R], 1, m![R = 1 # R, K]>(r)
+                .to_hbm_view(&mut device.tdma, slots.view_mut());
+            slots
+        };
+        for r in live.start()..live.start() + live.rows() {
+            let slots = slots(&mut *device, r);
+            let row: DmTensor<bf16, Chip, m![1 # 2], m![8 # 256], m![H]> = input
+                .view()
+                .tile::<m![R], 1, m![R = 1 # R, H]>(r)
+                .to_dm(&mut device.tdma);
+            // SAFETY: every slice of the eight holds the row; only the slice label changes.
+            let row: DmTensor<bf16, Chip, m![1 # 2], m![K # 256], m![H]> = unsafe { row.reshape() };
+            // A row's selections are of distinct experts, so its slots are distinct rows of the
+            // buffer.
+            dispatched
+                .view_mut()
+                .scatter::<m![{ S<X, R> }], m![H]>()
+                .by_byte_offsets(slots.view())
+                .from_dm_view(&mut device.tdma, row.view());
+        }
+        // SAFETY: each region's rows in order are its bands' rows in order.
+        self.run::<R>(&mut *device, &plan.bands, &dispatched, &mut computed);
+        for r in live.start()..live.start() + live.rows() {
+            let slots = slots(&mut *device, r);
+            let rows: DmTensor<bf16, Chip, m![1 # 2], m![K # 256], m![H]> = computed
+                .gather::<m![{ S<X, R> }], m![H]>()
+                .by_byte_offsets(&slots)
+                .to_dm(&mut device.tdma);
+            rows.view().to_hbm_view(
+                &mut device.tdma,
+                output
+                    .view_mut()
+                    .tile::<m![R], 1, m![R = 1 #{!} R, K, H]>(r),
+            );
+        }
+    }
+}
+
 /// `output[r][k] = experts[indices[r][k]](input[r])` for each live row `r` of `R` and each of its
 /// `K` selections; an index names one of the `X` experts.
 impl<'x, H: AxisName, I: AxisName, X: AxisName, R: AxisName, K: AxisName>
@@ -173,8 +328,25 @@ impl<'x, H: AxisName, I: AxisName, X: AxisName, R: AxisName, K: AxisName>
             Live<(), R>,
         ),
     ) -> Self::Output {
-        const { assert!(X::SIZE > 0 && K::SIZE > 0) };
         let mut output = Rows::<R, K, H>::new();
+        self.each(device, (input, indices, live), &mut output);
+        output
+    }
+}
+
+impl<H: AxisName, I: AxisName, X: AxisName> Experts<H, I, X> {
+    /// [`Self::forward`]'s rows, a selection at a time, into `output`.
+    pub fn each<R: AxisName, K: AxisName>(
+        &self,
+        device: &mut Device,
+        (input, indices, live): (
+            &HbmTensor<bf16, Chip, m![R, H]>,
+            &Indices<R, K>,
+            Live<(), R>,
+        ),
+        output: &mut Rows<R, K, H>,
+    ) {
+        const { assert!(X::SIZE > 0 && K::SIZE > 0) };
         for r in live.start()..live.start() + live.rows() {
             let mut row: HbmTensor<bf16, Chip, m![Single, H]> = HbmTensor::new();
             input
@@ -199,7 +371,6 @@ impl<'x, H: AxisName, I: AxisName, X: AxisName, R: AxisName, K: AxisName>
                 routed.view().to_hbm_view(&mut device.tdma, into);
             }
         }
-        output
     }
 }
 

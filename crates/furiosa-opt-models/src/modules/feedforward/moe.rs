@@ -12,6 +12,7 @@ use crate::ops::linear::Linear;
 use crate::ops::linear::experts::{Indices, Rows};
 use crate::ops::normalization::{Chunk, FeatureSlices};
 use crate::ops::reduction;
+use crate::ops::swiglu::dispatch::Dispatch;
 use crate::ops::swiglu::experts::Experts;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::{BroadcastClusters as Cluster, Rows as Layout};
@@ -497,7 +498,7 @@ impl<R: AxisName> AxisName for LaneGroups<R> {
 /// - A group of at most 256 rows runs at once, as the routing ops take them; the experts run only
 ///   the group's live rows, and the other rows' outputs are unspecified.
 #[derive(DeviceSend, Load)]
-pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName> {
+pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName, G: AxisName = Rows256> {
     /// The router's projection of a row to its experts' logits: `gate.weight`.
     pub gate: Linear<H, X, Chip>,
     /// The ranks the selection breaks ties by, built on host.
@@ -505,11 +506,22 @@ pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName> {
     pub select: TopK<X, S>,
     /// The experts, each under its index: `experts.{e}.{gate,up,down}_proj`.
     pub experts: Experts<H, I, X>,
+    /// The constants that order a group's selections by expert, built on host.
+    #[load(rename = "")]
+    pub dispatch: Dispatch<G, S, X>,
 }
 
-impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName> Sparse<H, I, X, S> {
-    /// The block's output for each of `rows`, its live rows computed.
-    pub fn rows<R: AxisName>(
+/// A routing group's rows: the most a router's selection takes at once.
+pub type Rows256 = crate::tensor::axis::Rows<256>;
+
+/// The live rows of a group from which its experts run grouped, each expert's selections in
+/// bands, rather than a selection at a time.
+pub const GROUPED: usize = 16;
+
+impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName, R: AxisName> Sparse<H, I, X, S, R> {
+    /// The block's output for each of `rows`, its live rows computed: a selection at a time for
+    /// a few live rows, grouped by expert from [`GROUPED`].
+    pub fn rows(
         &self,
         device: &mut Device,
         rows: &HbmTensor<bf16, Chip, m![R, H]>,
@@ -519,7 +531,14 @@ impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName> Sparse<H, I, X, S> {
         let logits = Op::forward(&self.gate, &mut *device, rows);
         let (indices, probabilities) = self.select.forward(&mut *device, (), &mut (), &logits);
         let probabilities = Normalize.forward(&mut *device, (), &mut (), probabilities);
-        let routed = Op::forward(&self.experts, &mut *device, (rows, &indices, live));
+        let mut routed = Rows::<R, S, H>::new();
+        let selected = (rows, &indices, live);
+        if live.rows() < GROUPED {
+            self.experts.each(&mut *device, selected, &mut routed);
+        } else {
+            self.experts
+                .grouped(&mut *device, selected, &self.dispatch, &mut routed);
+        }
         // The live rows' sums, eight rows at a time: a fold of every row reads all of them.
         // SAFETY: the rows in order are their groups' rows in order.
         let (routed, probabilities) = unsafe {
@@ -1115,10 +1134,11 @@ mod tests {
             Group = 256
         ];
 
-        /// The test's live rows of its 256, a routing group's.
-        const LIVE: usize = 7;
+        /// The test's live rows of its 256, a routing group's: a few, run a selection at a time,
+        /// and enough to run grouped by expert, a part of the group and all of it.
+        const LIVE: [usize; 3] = [7, 40, 256];
 
-        type Block = Sparse<Width, Inner, Choices, Picked>;
+        type Block = Sparse<Width, Inner, Choices, Picked, Group>;
 
         #[device(chip = 1)]
         fn routed(
@@ -1131,7 +1151,8 @@ mod tests {
             block.rows(device, rows, live)
         }
 
-        /// Each live row is the sum of its eight most probable experts' outputs weighted by their
+        /// Each live row, a few or many, is the sum of its eight most probable experts' outputs
+        /// weighted by their
         /// renormalized probabilities, as a host reference of the router, the experts and the sum
         /// gives it, to a step of the output's rounding.
         #[tokio::test(flavor = "current_thread")]
@@ -1164,52 +1185,55 @@ mod tests {
                     .unwrap(),
                 ),
                 experts: experts::<Width, Inner, Choices>(&mut device, &banks).await,
+                dispatch: crate::ops::swiglu::dispatch::Dispatch::uploaded(&mut device).await,
             };
             let input = HostTensor::<bf16, m![Group, Width]>::from_vec(rows.clone())
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap();
-            let count = HostTensor::<i32, m![1]>::from_vec(vec![LIVE as i32])
-                .to_hbm(&mut device.pdma)
-                .await
-                .unwrap();
-            let output = launch(routed, (&mut device, &block, &input, &count))
-                .await
-                .unwrap()
-                .to_host::<m![Group, Width]>(&mut device.pdma)
-                .await
-                .unwrap()
-                .into_vec();
-            for r in 0..LIVE {
-                let row = &rows[r * w..][..w];
-                let logits: Vec<f32> = (0..x)
-                    .map(|e| {
-                        let sum: f32 = (0..w)
-                            .map(|h| gate[e * w + h].to_f32() * row[h].to_f32())
-                            .sum();
-                        bf16::from_f32(sum).to_f32()
-                    })
-                    .collect();
-                let top = logits.iter().cloned().fold(f32::MIN, f32::max);
-                let exps: Vec<f32> = logits.iter().map(|l| (l - top).exp()).collect();
-                let mut order: Vec<usize> = (0..x).collect();
-                order.sort_by(|&a, &b| exps[b].total_cmp(&exps[a]).then(a.cmp(&b)));
-                let picked = &order[..Picked::SIZE];
-                let total: f32 = picked.iter().map(|&e| exps[e]).sum();
-                let mut want = vec![0f32; w];
-                for &e in picked {
-                    let selection = oracle(row, &banks[e]);
-                    for (sum, v) in want.iter_mut().zip(selection) {
-                        *sum += exps[e] / total * bf16::from_f32(v).to_f32();
+            for live in LIVE {
+                let count = HostTensor::<i32, m![1]>::from_vec(vec![live as i32])
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap();
+                let output = launch(routed, (&mut device, &block, &input, &count))
+                    .await
+                    .unwrap()
+                    .to_host::<m![Group, Width]>(&mut device.pdma)
+                    .await
+                    .unwrap()
+                    .into_vec();
+                for r in 0..live {
+                    let row = &rows[r * w..][..w];
+                    let logits: Vec<f32> = (0..x)
+                        .map(|e| {
+                            let sum: f32 = (0..w)
+                                .map(|h| gate[e * w + h].to_f32() * row[h].to_f32())
+                                .sum();
+                            bf16::from_f32(sum).to_f32()
+                        })
+                        .collect();
+                    let top = logits.iter().cloned().fold(f32::MIN, f32::max);
+                    let exps: Vec<f32> = logits.iter().map(|l| (l - top).exp()).collect();
+                    let mut order: Vec<usize> = (0..x).collect();
+                    order.sort_by(|&a, &b| exps[b].total_cmp(&exps[a]).then(a.cmp(&b)));
+                    let picked = &order[..Picked::SIZE];
+                    let total: f32 = picked.iter().map(|&e| exps[e]).sum();
+                    let mut want = vec![0f32; w];
+                    for &e in picked {
+                        let selection = oracle(row, &banks[e]);
+                        for (sum, v) in want.iter_mut().zip(selection) {
+                            *sum += exps[e] / total * bf16::from_f32(v).to_f32();
+                        }
                     }
-                }
-                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-                for (o, (got, want)) in output[r * w..][..w].iter().zip(&want).enumerate() {
-                    let error = (got.to_f32() - want).abs();
-                    assert!(
-                        error <= scale * 2f32.powi(-6),
-                        "row {r} output {o}: {got:?} vs {want} (experts {picked:?})"
-                    );
+                    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    for (o, (got, want)) in output[r * w..][..w].iter().zip(&want).enumerate() {
+                        let error = (got.to_f32() - want).abs();
+                        assert!(
+                            error <= scale * 2f32.powi(-6),
+                            "{live} live rows: row {r} output {o}: {got:?} vs {want} (experts {picked:?})"
+                        );
+                    }
                 }
             }
         }
