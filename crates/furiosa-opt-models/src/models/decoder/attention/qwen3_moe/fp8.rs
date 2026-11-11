@@ -17,7 +17,7 @@ use crate::load::{Checkpoint, Context, Load, LoadError, Named};
 use crate::models::config::{self, Quantization, Scheme, scaling::Spectrum};
 use crate::models::decoder::attention::qwen3::{self, launch};
 use crate::models::decoder::attention::{
-    Geometry, Head, KvHeads, PaddedVocabulary, Qwen2ForCausalLM, Qwen2Layer, Windows,
+    Chunks, Geometry, Head, KvHeads, PaddedVocabulary, Qwen2ForCausalLM, Qwen2Layer,
 };
 use crate::models::decoder::{Form, form::Affine};
 use crate::models::{Class, Family, Implements};
@@ -125,10 +125,11 @@ impl qwen3::Front for Size {
 // The rotary tiles of a launch's 1024 rows.
 axes![Slots = 8];
 
-/// A call as Qwen3-4B's, whose attention geometry this is.
+/// A call as Qwen3-4B's, whose attention geometry this is, over the checkpoint's whole context:
+/// the shared context of the paged history and a rotary table of its 40960 positions.
 impl Decode for Size {
     type Rows = Limit<16, 64>;
-    type Windows = Windows<256>;
+    type Windows = Chunks;
     type Width = ProjectionWidth<6144>;
     type Packed = m![{ Symbol<ProjectionWidth<6144>> }, { Symbol<Hidden> }];
     type Work = qwen3::Work<QueryGroups<4>, { qwen3::tiles::<Self>() }>;
@@ -136,8 +137,14 @@ impl Decode for Size {
     type Reach = axis::Rows<2048>;
     type Sequences = axis::Rows<8>;
     type Slots = Slots;
-    type Positions = axis::Rows<32768>;
+    type Positions = axis::Rows<CONTEXT>;
 }
+
+/// The positions a request reaches: the checkpoint's `max_position_embeddings`, every position
+/// the launch's paged history holds.
+pub const CONTEXT: usize = 40960;
+
+const _: () = assert!(CONTEXT == launch::CONTEXT);
 
 const _: () = assert!(KvHeads::SIZE == 2 * STORED_HEADS);
 

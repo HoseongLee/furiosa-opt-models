@@ -167,6 +167,46 @@ fn continues_the_prompt_with_the_reference_tokens() {
     });
 }
 
+/// The served checkpoint serves its whole declared context: its window is 40960 positions, and a
+/// row at the last of them runs over a cache of every block, zeroed, to a token of the vocabulary.
+#[test]
+#[ignore = "opens a device and loads the pinned checkpoint"]
+fn serves_the_whole_declared_context() {
+    let mut device = Device::new(Topology { chips: 1, pes: 8 }).unwrap();
+    let model = Instance::new(
+        served().load::<ForCausalLM>(&mut device).unwrap(),
+        Tiling::Adaptive,
+    );
+    let limits = model.limits();
+    assert_eq!(limits.window, 40960);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let count = limits.window.div_ceil(16);
+        let blocks: Vec<u32> = (0..count as u32).collect();
+        let cache = Cache::new(&device, &limits.cache, count).unwrap();
+        // Zero keys and values in place of a 40959-token history: finite, so every score is.
+        let zeros = vec![0u8; cache.layers()[0].size()];
+        for layer in cache.layers() {
+            let mut target = layer.alias(..).unwrap();
+            HostBufferSlice::from(&zeros[..layer.size()])
+                .to_hbm(&mut device.pdma)
+                .output(&mut target)
+                .await
+                .unwrap();
+        }
+        let request = request(&mut device, &[PROMPT[0]], limits.window - 1, &blocks).await;
+        let output = model
+            .forward(&mut device, &cache, &[request], &[])
+            .await
+            .unwrap();
+        let token = token(&mut device, output).await;
+        assert!((0..151936).contains(&token), "{token}");
+    });
+}
+
 // # Configs
 
 /// Each size parses its published checkpoint's config and refuses the other size's by its width.
