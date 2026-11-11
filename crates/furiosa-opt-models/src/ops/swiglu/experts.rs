@@ -9,19 +9,24 @@
 //!   launch's routing never leaves it, and no buffer is chosen at run time.
 //! - The selections of rows past the live ones are not computed, and their output rows hold
 //!   whatever was there.
-//! - The SiLU of the gate rounds to BF16 before it multiplies the up projection, and the product
-//!   rounds to BF16 before the down projection quantizes it, as for dense rows.
+//! - An expert's gate and up projections are packed into one, gate first, as a dense gated MLP's
+//!   are; the SiLU of the gate rounds to BF16 before it multiplies the up projection, and the
+//!   product rounds to BF16 before the down projection quantizes it, as for dense rows.
 
 use crate::Op;
 use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::ops::linear::experts::{Indices, Rows};
 use crate::ops::pointwise::{activation::Silu, multiply::Multiply};
+use crate::ops::swiglu::GateUp;
 use crate::tensor::axis::Single;
-use crate::tensor::form::{BlockScaled, fp8};
+use crate::tensor::form::{BlockScaled, Part, fp8};
 use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
 use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
+
+// The gate, then the up projection, in a packed row.
+axes![Term = 2];
 
 /// A block-scaled E4M3 projection of `In` features to `Out` on one chip.
 pub type Projection<In, Out> =
@@ -56,39 +61,45 @@ impl<In: AxisName, Out: AxisName, X: AxisName> Bank<In, Out, X> {
     }
 }
 
-/// The projection `name` of every expert under the context's name, `0` to `X - 1`, each its codes
+/// The projections `names` of every expert under the context's name, `0` to `X - 1`, packed in
+/// order along their outputs, as a gated MLP packs its gate and up projections: each its codes
 /// under `weight` and its scales under either spelling, stacked in one tensor each.
-fn bank<In: AxisName, Out: AxisName, X: AxisName>(
+fn bank<In: AxisName, Out: AxisName, X: AxisName, const N: usize>(
     context: &mut Context<'_>,
     from: &Checkpoint,
-    name: &str,
+    names: [&str; N],
 ) -> Result<Bank<In, Out, X>, LoadError> {
+    type P<Out, const N: usize> = Part<Out, N>;
     let mut children = Children::default();
     let (mut codes, mut scales) = (Vec::new(), Vec::new());
     for expert in 0..X::SIZE {
         let at = expert.to_string();
-        let read = context.field(&at, &at, |cx| {
-            cx.field(name, name, |cx| {
-                let weight = cx.field("weight", "weight", |cx| {
-                    from.host::<f8e4m3, m![Out, In], m![Out, In]>(cx)
-                });
-                let scale = cx.field("weight_scale", "", |cx| {
-                    fp8::scales::<In, Out, Chip>(from, cx)
-                });
-                Ok::<_, LoadError>((weight?, scale?))
-            })
-        });
-        if let Some((weight, scale)) = children.ask(read)? {
-            codes.extend(weight.into_vec());
-            scales.extend(scale.into_vec());
+        for name in names {
+            let read = context.field(&at, &at, |cx| {
+                cx.field(name, name, |cx| {
+                    let weight = cx.field("weight", "weight", |cx| {
+                        from.host::<f8e4m3, m![{ Symbol<P<Out, N>> }, In], m![{ Symbol<P<Out, N>> }, In]>(cx)
+                    });
+                    let scale = cx.field("weight_scale", "", |cx| {
+                        fp8::scales::<In, P<Out, N>, Chip>(from, cx)
+                    });
+                    Ok::<_, LoadError>((weight?, scale?))
+                })
+            });
+            // The scales are laid out output-major, so the packed weight's are each part's in turn.
+            if let Some((weight, scale)) = children.ask(read)? {
+                codes.extend(weight.into_vec());
+                scales.extend(scale.into_vec());
+            }
         }
     }
     children.node(Some(()))?;
-    let weight = context.field(name, "", |cx| {
+    let tree = names.join("_");
+    let weight = context.field(&tree, "", |cx| {
         HbmTensor::load(cx, HostTensor::<f8e4m3, m![X, Out, In]>::from_vec(codes))
     })?;
     let scales = HostTensor::<f32, m![X, { fp8::Scales<In, Out> }]>::from_vec(scales);
-    let weight_scale = context.field(name, "", |cx| HbmTensor::load(cx, scales))?;
+    let weight_scale = context.field(&tree, "", |cx| HbmTensor::load(cx, scales))?;
     Ok(Bank {
         weight,
         weight_scale,
@@ -99,8 +110,8 @@ fn bank<In: AxisName, Out: AxisName, X: AxisName>(
 /// experts: their checkpoint's `{expert}.{gate,up,down}_proj`.
 #[derive(DeviceSend)]
 pub struct Experts<Hidden: AxisName, Intermediate: AxisName, X: AxisName> {
-    pub gate_proj: Bank<Hidden, Intermediate, X>,
-    pub up_proj: Bank<Hidden, Intermediate, X>,
+    /// The gate and up projections packed, gate first.
+    pub gate_up: Bank<Hidden, GateUp<Intermediate>, X>,
     pub down_proj: Bank<Intermediate, Hidden, X>,
 }
 
@@ -108,15 +119,10 @@ impl<'a, H: AxisName, I: AxisName, X: AxisName> Load<&'a Checkpoint> for Experts
     fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
         context.checkpoint(from, |cx| {
             let mut children = Children::default();
-            let gate = children.ask(bank(cx, from, "gate_proj"))?;
-            let up = children.ask(bank(cx, from, "up_proj"))?;
-            let down = children.ask(bank(cx, from, "down_proj"))?;
-            let ((gate_proj, up_proj), down_proj) = children.node(gate.zip(up).zip(down))?;
-            Ok(Self {
-                gate_proj,
-                up_proj,
-                down_proj,
-            })
+            let gate_up = children.ask(bank(cx, from, ["gate_proj", "up_proj"]))?;
+            let down = children.ask(bank(cx, from, ["down_proj"]))?;
+            let (gate_up, down_proj) = children.node(gate_up.zip(down))?;
+            Ok(Self { gate_up, down_proj })
         })
     }
 }
@@ -130,8 +136,17 @@ impl<H: AxisName, I: AxisName, X: AxisName> Experts<H, I, X> {
         expert: usize,
         row: &HbmTensor<bf16, Chip, m![H]>,
     ) -> HbmTensor<bf16, Chip, m![H]> {
-        let gate = self.gate_proj.expert(expert).forward(&mut *device, row);
-        let up = self.up_proj.expert(expert).forward(&mut *device, row);
+        let gate_up = self.gate_up.expert(expert).forward(&mut *device, row);
+        // SAFETY: the packed features are the gate's, then the up projection's, in order.
+        let gate_up: HbmTensor<bf16, Chip, m![Term, I]> = unsafe { gate_up.reshape() };
+        // SAFETY: each tile is one half's features in order, read as their own vector.
+        let half = |term: usize| unsafe {
+            gate_up
+                .view()
+                .tile::<m![Term], 1, m![Term = 1 # Term, I]>(term)
+                .alias::<Chip, m![I]>()
+        };
+        let (gate, up) = (half(0), half(1));
         let gate = Silu.forward(&mut *device, &gate);
         let product = Multiply.forward(&mut *device, (&gate, &up));
         self.down_proj.expert(expert).forward(device, &product)
@@ -251,16 +266,24 @@ pub(crate) mod tests {
         values.into_iter().map(bf16::from_f32).collect()
     }
 
-    /// One projection of every expert of `banks`, at index `at` of each, stacked on the device.
+    /// The projections `parts` of every expert of `banks`, packed along their outputs in order
+    /// and stacked on the device.
     async fn stacked<In: AxisName, Out: AxisName, X: AxisName>(
         device: &mut Device,
         banks: &[[Weights; 3]],
-        at: usize,
+        parts: &[usize],
     ) -> Bank<In, Out, X> {
-        let codes: Vec<f8e4m3> = banks.iter().flat_map(|b| b[at].0.clone()).collect();
-        let scales: Vec<f32> = (banks.iter())
-            .flat_map(|b| layout::<In, Out>(&b[at].1))
-            .collect();
+        let (mut codes, mut scales) = (Vec::<f8e4m3>::new(), Vec::<f32>::new());
+        for bank in banks {
+            for &at in parts {
+                codes.extend(bank[at].0.iter().copied());
+                let rows = Out::SIZE / parts.len();
+                scales.extend(match parts.len() {
+                    1 => layout::<In, Out>(&bank[at].1),
+                    _ => part_layout::<In>(&bank[at].1, rows),
+                });
+            }
+        }
         Bank {
             weight: HostTensor::<f8e4m3, m![X, Out, In]>::from_vec(codes)
                 .to_hbm(&mut device.pdma)
@@ -270,6 +293,27 @@ pub(crate) mod tests {
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
+        }
+    }
+
+    /// The scale layout of one projection of `rows` outputs, as [`layout`] gives it.
+    fn part_layout<In: AxisName>(grid: &[f32], rows: usize) -> Vec<f32> {
+        #[derive(Clone, Debug)]
+        struct Rows768;
+        impl AxisName for Rows768 {
+            const NAME: Ident = Ident::new("Rows768");
+            const SIZE: usize = 768;
+        }
+        #[derive(Clone, Debug)]
+        struct Rows256;
+        impl AxisName for Rows256 {
+            const NAME: Ident = Ident::new("Rows256");
+            const SIZE: usize = 256;
+        }
+        match rows {
+            768 => layout::<In, Rows768>(grid),
+            256 => layout::<In, Rows256>(grid),
+            _ => unreachable!("the tests' projections have 256 or 768 outputs"),
         }
     }
 
@@ -297,9 +341,8 @@ pub(crate) mod tests {
     ) -> Experts<H, I, X> {
         assert_eq!(banks.len(), X::SIZE);
         Experts {
-            gate_proj: stacked::<H, I, X>(device, banks, 0).await,
-            up_proj: stacked::<H, I, X>(device, banks, 1).await,
-            down_proj: stacked::<I, H, X>(device, banks, 2).await,
+            gate_up: stacked::<H, GateUp<I>, X>(device, banks, &[0, 1]).await,
+            down_proj: stacked::<I, H, X>(device, banks, &[2]).await,
         }
     }
 
