@@ -109,6 +109,13 @@
       "download": ["*.json", "*.safetensors"]
     },
     {
+      "id": "furiosa-ai/Qwen3-30B-A3B-FP8", "tier": "nightly", "task": "text",
+      "doc": "qwen3-30b-a3b-fp8", "revision": "979f37342a14e0eb4d5d943c85167f3dee065b85",
+      "quantization": {"weights": ["Block FP8 experts", "BF16 attention"], "activations": ["Dynamic FP8 experts", "BF16 attention"]},
+      "serve": ["--max-model-len", "32768"],
+      "download": ["*.json", "*.safetensors"]
+    },
+    {
       "id": "NousResearch/Meta-Llama-3-8B", "tier": "nightly",
       "task": "text",
       "doc": "llama3-8b",

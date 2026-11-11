@@ -128,6 +128,18 @@ impl<X, R: AxisName> Live<X, R> {
         }
     }
 
+    /// Live tile `index` of `T` rows as the first rows of an envelope of its own, `T` rows, for an
+    /// op that takes a tile apart from the rest; computed without a branch, as [`Self::tile`] is.
+    pub fn group<T: AxisName>(&self, index: usize) -> Live<(), T> {
+        let tile = self.tile::<T>(index);
+        Live {
+            value: (),
+            rows: tile.rows,
+            start: 0,
+            envelope: PhantomData,
+        }
+    }
+
     /// The tiles of `T` rows holding live rows, the last possibly partial. Rounded up by addition,
     /// so a loop over them is allocated for exactly the envelope's tiles.
     pub fn count<T: AxisName>(&self) -> usize {

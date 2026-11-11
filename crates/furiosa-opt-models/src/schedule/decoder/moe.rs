@@ -50,27 +50,16 @@ fn sparse(
     // SAFETY: a span's rows in order are its groups' rows in order.
     let features: HbmTensor<bf16, Chip, m![Groups, Group, Hidden]> = unsafe { features.reshape() };
     let mut routed: HbmTensor<bf16, Chip, m![Groups, Group, Hidden]> = HbmTensor::new();
-    let live = rows.rows();
-    for group in 0..live.div_ceil(Group::SIZE) {
+    for group in 0..rows.count::<Group>() {
         let mut input: HbmTensor<bf16, Chip, m![Group, Hidden]> = HbmTensor::new();
-        // SAFETY: the tile is group `group`'s rows in order; only the group axis drops.
-        let tile = unsafe {
-            features
-                .view()
-                .tile::<m![Groups], 1, m![Groups = 1 # Groups, Group, Hidden]>(group)
-                .reshape::<Chip, m![Group, Hidden]>()
-        };
-        tile.to_hbm_view(&mut device.tdma, input.view_mut());
-        let first = group * Group::SIZE;
-        let rows = Live::<(), Group>::over((live - first).min(Group::SIZE));
-        let output = block.rows(&mut *device, &input, rows);
-        // SAFETY: as above, the group's rows of the block's output.
-        let into = unsafe {
-            routed
-                .view_mut()
-                .tile::<m![Groups], 1, m![Groups = 1 #{!} Groups, Group, Hidden]>(group)
-                .reshape::<Chip, m![Group, Hidden]>()
-        };
+        features
+            .view()
+            .tile::<m![Groups], 1, m![Groups = 1 # Groups, Group, Hidden]>(group)
+            .to_hbm_view(&mut device.tdma, input.view_mut());
+        let output = block.rows(&mut *device, &input, rows.group::<Group>(group));
+        let into = routed
+            .view_mut()
+            .tile::<m![Groups], 1, m![Groups = 1 #{!} Groups, Group, Hidden]>(group);
         output.view().to_hbm_view(&mut device.tdma, into);
     }
     // SAFETY: the groups' rows in order are the span's.

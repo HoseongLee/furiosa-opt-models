@@ -80,7 +80,7 @@ pub type Output = Named<"o_proj", <Affine as Form>::Output<Queries, Hidden, Hbm>
 
 /// HF `Qwen3MoeSparseMoeBlock`: the router's gate, its eight of 128 experts by renormalized
 /// probability, and the experts in block-scaled E4M3.
-pub type Block = Sparse<Hidden, Intermediate, ExpertCount, Selected, { ExpertCount::<128>::SIZE }>;
+pub type Block = Sparse<Hidden, Intermediate, ExpertCount, Selected>;
 
 type Norm = qwen3::QwenNorm<Hidden, Hbm>;
 

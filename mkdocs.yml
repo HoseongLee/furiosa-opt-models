@@ -144,6 +144,8 @@ nav:
               - models/qwen3-1.7b.md
               - models/qwen3-4b.md
               - models/qwen3-8b.md
+          - Qwen3 MoE:
+              - models/qwen3-30b-a3b-fp8.md
           - Llama:
               - models/llama3-8b.md
               - models/llama3.1-8b-nvfp4.md

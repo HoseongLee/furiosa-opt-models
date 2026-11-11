@@ -23,7 +23,7 @@ use furiosa_opt_models::Module;
 use furiosa_opt_models::load::{Context, Load};
 use furiosa_opt_models::models::decoder::attention::qwen3::{fp8, launch};
 use furiosa_opt_models::models::decoder::attention::{Chunks, Head, KvHeads};
-use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{Geometry, llama, qwen3, qwen3_moe};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::modules::attention::key_value;
 use furiosa_opt_models::modules::language::{Input, Selected};
@@ -507,6 +507,7 @@ launches!(
     [B] launch::Over<qwen3::Size<"8B">, B>, qwen3::Size<"8B">;
     [] fp8::ForCausalLM, qwen3::Size<"8B">;
     [] llama::nvfp4::ForCausalLM, llama::nvfp4::Size;
+    [] qwen3_moe::fp8::ForCausalLM, qwen3_moe::fp8::Size;
 );
 
 #[cfg(test)]

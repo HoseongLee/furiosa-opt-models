@@ -4,56 +4,148 @@
 //! - An expert is its checkpoint's `gate_proj`, `up_proj` and `down_proj`, each a 128 x 128
 //!   block-scaled E4M3 weight ([`fp8::Block`]); a projection quantizes its input at run time in
 //!   groups of 128 inputs, as the block linear of one row states.
-//! - A selection's expert is read from the router's indices on the device, so a launch's routing
-//!   never leaves it; the selections of rows past the live ones are not computed, and their output
-//!   rows hold whatever was there.
+//! - A [`Bank`] stacks every expert's codes and scales of one projection in one tensor each, so a
+//!   selection's expert is an offset into them, read from the router's indices on the device: a
+//!   launch's routing never leaves it, and no buffer is chosen at run time.
+//! - The selections of rows past the live ones are not computed, and their output rows hold
+//!   whatever was there.
 //! - The SiLU of the gate rounds to BF16 before it multiplies the up projection, and the product
 //!   rounds to BF16 before the down projection quantizes it, as for dense rows.
 
 use crate::Op;
-use crate::load::Load;
+use crate::load::{Checkpoint, Children, Context, Load, LoadError};
 use crate::ops::linear::experts::{Indices, Rows};
 use crate::ops::pointwise::{activation::Silu, multiply::Multiply};
+use crate::tensor::axis::Single;
 use crate::tensor::form::{BlockScaled, fp8};
 use crate::tensor::live::Live;
 use crate::tensor::parallel::Chip;
+use core::marker::PhantomData;
 use furiosa_opt_std::prelude::*;
 
 /// A block-scaled E4M3 projection of `In` features to `Out` on one chip.
 pub type Projection<In, Out> =
     BlockScaled<In, Out, f8e4m3, f32, fp8::Scales<In, Out>, fp8::Block, Chip>;
 
-/// One expert's gated feed-forward of `Hidden` features over `Intermediate` ones.
-#[derive(DeviceSend, Load)]
-pub struct Expert<Hidden: AxisName, Intermediate: AxisName> {
-    pub gate_proj: Projection<Hidden, Intermediate>,
-    pub up_proj: Projection<Hidden, Intermediate>,
-    pub down_proj: Projection<Intermediate, Hidden>,
+/// One projection of each of `X` experts: their codes in `[expert, Out, In]` order and their block
+/// scales, each expert's laid out as [`fp8::Scales`].
+#[derive(DeviceSend)]
+pub struct Bank<In: AxisName, Out: AxisName, X: AxisName> {
+    pub weight: HbmTensor<f8e4m3, Chip, m![X, Out, In]>,
+    pub weight_scale: HbmTensor<f32, Chip, m![X, { fp8::Scales<In, Out> }]>,
 }
 
-impl<H: AxisName, I: AxisName> Expert<H, I> {
-    /// `down(round(silu(gate(row))) * up(row))`, each projection rounded once to BF16.
+impl<In: AxisName, Out: AxisName, X: AxisName> Bank<In, Out, X> {
+    /// Expert `expert`'s projection, a view of its codes and scales.
+    pub fn expert(&self, expert: usize) -> Projection<In, Out> {
+        // SAFETY: the weights are read-only; the tile is one expert's codes, then its scales, in
+        // order.
+        let (weight, weight_scale) = unsafe {
+            (
+                self.weight
+                    .view()
+                    .tile::<m![X], 1, m![X = 1 # X, Out, In]>(expert)
+                    .alias::<Chip, m![Out, In]>(),
+                self.weight_scale
+                    .view()
+                    .tile::<m![X], 1, m![X = 1 # X, { fp8::Scales<In, Out> }]>(expert)
+                    .alias::<Chip, fp8::Scales<In, Out>>(),
+            )
+        };
+        BlockScaled::new(weight, weight_scale, fp8::Block)
+    }
+}
+
+/// The projection `name` of every expert under the context's name, `0` to `X - 1`, each its codes
+/// under `weight` and its scales under either spelling, stacked in one tensor each.
+fn bank<In: AxisName, Out: AxisName, X: AxisName>(
+    context: &mut Context<'_>,
+    from: &Checkpoint,
+    name: &str,
+) -> Result<Bank<In, Out, X>, LoadError> {
+    let mut children = Children::default();
+    let (mut codes, mut scales) = (Vec::new(), Vec::new());
+    for expert in 0..X::SIZE {
+        let at = expert.to_string();
+        let read = context.field(&at, &at, |cx| {
+            cx.field(name, name, |cx| {
+                let weight = cx.field("weight", "weight", |cx| {
+                    from.host::<f8e4m3, m![Out, In], m![Out, In]>(cx)
+                });
+                let scale = cx.field("weight_scale", "", |cx| {
+                    fp8::scales::<In, Out, Chip>(from, cx)
+                });
+                Ok::<_, LoadError>((weight?, scale?))
+            })
+        });
+        if let Some((weight, scale)) = children.ask(read)? {
+            codes.extend(weight.into_vec());
+            scales.extend(scale.into_vec());
+        }
+    }
+    children.node(Some(()))?;
+    let weight = context.field(name, "", |cx| {
+        HbmTensor::load(cx, HostTensor::<f8e4m3, m![X, Out, In]>::from_vec(codes))
+    })?;
+    let scales = HostTensor::<f32, m![X, { fp8::Scales<In, Out> }]>::from_vec(scales);
+    let weight_scale = context.field(name, "", |cx| HbmTensor::load(cx, scales))?;
+    Ok(Bank {
+        weight,
+        weight_scale,
+    })
+}
+
+/// Every expert's gated feed-forward of `Hidden` features over `Intermediate` ones, for `X`
+/// experts: their checkpoint's `{expert}.{gate,up,down}_proj`.
+#[derive(DeviceSend)]
+pub struct Experts<Hidden: AxisName, Intermediate: AxisName, X: AxisName> {
+    pub gate_proj: Bank<Hidden, Intermediate, X>,
+    pub up_proj: Bank<Hidden, Intermediate, X>,
+    pub down_proj: Bank<Intermediate, Hidden, X>,
+}
+
+impl<'a, H: AxisName, I: AxisName, X: AxisName> Load<&'a Checkpoint> for Experts<H, I, X> {
+    fn load(context: &mut Context<'_>, from: &'a Checkpoint) -> Result<Self, LoadError> {
+        context.checkpoint(from, |cx| {
+            let mut children = Children::default();
+            let gate = children.ask(bank(cx, from, "gate_proj"))?;
+            let up = children.ask(bank(cx, from, "up_proj"))?;
+            let down = children.ask(bank(cx, from, "down_proj"))?;
+            let ((gate_proj, up_proj), down_proj) = children.node(gate.zip(up).zip(down))?;
+            Ok(Self {
+                gate_proj,
+                up_proj,
+                down_proj,
+            })
+        })
+    }
+}
+
+impl<H: AxisName, I: AxisName, X: AxisName> Experts<H, I, X> {
+    /// `down(round(silu(gate(row))) * up(row))` through expert `expert`, each projection rounded
+    /// once to BF16.
     pub fn row(
         &self,
         device: &mut Device,
+        expert: usize,
         row: &HbmTensor<bf16, Chip, m![H]>,
     ) -> HbmTensor<bf16, Chip, m![H]> {
-        let gate = self.gate_proj.forward(&mut *device, row);
-        let up = self.up_proj.forward(&mut *device, row);
+        let gate = self.gate_proj.expert(expert).forward(&mut *device, row);
+        let up = self.up_proj.expert(expert).forward(&mut *device, row);
         let gate = Silu.forward(&mut *device, &gate);
         let product = Multiply.forward(&mut *device, (&gate, &up));
-        self.down_proj.forward(device, &product)
+        self.down_proj.expert(expert).forward(device, &product)
     }
 }
 
 /// `output[r][k] = experts[indices[r][k]](input[r])` for each live row `r` of `R` and each of its
-/// `K` selections; an index names one of the `E` experts.
-impl<'x, H: AxisName, I: AxisName, R: AxisName, K: AxisName, const E: usize>
+/// `K` selections; an index names one of the `X` experts.
+impl<'x, H: AxisName, I: AxisName, X: AxisName, R: AxisName, K: AxisName>
     Op<(
         &'x HbmTensor<bf16, Chip, m![R, H]>,
         &'x Indices<R, K>,
         Live<(), R>,
-    )> for [Expert<H, I>; E]
+    )> for Experts<H, I, X>
 {
     type Output = Rows<R, K, H>;
 
@@ -66,9 +158,16 @@ impl<'x, H: AxisName, I: AxisName, R: AxisName, K: AxisName, const E: usize>
             Live<(), R>,
         ),
     ) -> Self::Output {
-        const { assert!(E > 0 && K::SIZE > 0) };
+        const { assert!(X::SIZE > 0 && K::SIZE > 0) };
         let mut output = Rows::<R, K, H>::new();
         for r in live.start()..live.start() + live.rows() {
+            let mut row: HbmTensor<bf16, Chip, m![Single, H]> = HbmTensor::new();
+            input
+                .view()
+                .tile::<m![R], 1, m![R = 1 # R, H]>(r)
+                .to_hbm_view(&mut device.tdma, row.view_mut());
+            // SAFETY: one row's features in order; only the row axis of one drops.
+            let row: HbmTensor<bf16, Chip, m![H]> = unsafe { row.reshape() };
             for k in 0..K::SIZE {
                 let mut at: HbmTensor<i32, Chip, m![1]> = HbmTensor::new();
                 indices
@@ -77,16 +176,7 @@ impl<'x, H: AxisName, I: AxisName, R: AxisName, K: AxisName, const E: usize>
                     .tile::<m![K], 1, m![R = 1 # R, K = 1 # K, 1 # 2]>(k)
                     .to_hbm_view(&mut device.tdma, at.view_mut());
                 let expert = at.view().to_spm(&mut device.tdma) as usize;
-                // SAFETY: the tile is row `r`'s features in order; only the row axis drops.
-                let tile = unsafe {
-                    input
-                        .view()
-                        .tile::<m![R], 1, m![R = 1 # R, H]>(r)
-                        .reshape::<Chip, m![H]>()
-                };
-                let mut row: HbmTensor<bf16, Chip, m![H]> = HbmTensor::new();
-                tile.to_hbm_view(&mut device.tdma, row.view_mut());
-                let routed = self[expert].row(&mut *device, &row);
+                let routed = self.row(&mut *device, expert, &row);
                 let into = output
                     .view_mut()
                     .tile::<m![R], 1, m![R = 1 #{!} R, K, H]>(r)
@@ -105,10 +195,9 @@ pub(crate) mod tests {
     use crate::tensor::form::fp8::{GROUP, layout};
     use crate::tensor::scalar::Value;
     use crate::tests::DEVICE;
-    use core::marker::PhantomData;
     use furiosa_opt_std::runtime::launch;
 
-    axes![Width = 512, Inner = 256, Eight = 8, Two = 2];
+    axes![Width = 512, Inner = 256, Eight = 8, Two = 2, Four = 4];
 
     /// Each row's two selections among four experts; rows past the live ones select too.
     const SELECTED: [i32; 16] = [2, 0, 1, 3, 3, 2, 0, 1, 1, 1, 2, 0, 3, 0, 0, 2];
@@ -119,7 +208,7 @@ pub(crate) mod tests {
     #[device(chip = 1)]
     fn routed(
         device: &mut Device,
-        experts: &[Expert<Width, Inner>; 4],
+        experts: &Experts<Width, Inner, Four>,
         input: &HbmTensor<bf16, Chip, m![Eight, Width]>,
         indices: &Indices<Eight, Two>,
         count: &Value<Chip>,
@@ -162,23 +251,25 @@ pub(crate) mod tests {
         values.into_iter().map(bf16::from_f32).collect()
     }
 
-    pub(crate) async fn projection<In: AxisName, Out: AxisName>(
+    /// One projection of every expert of `banks`, at index `at` of each, stacked on the device.
+    async fn stacked<In: AxisName, Out: AxisName, X: AxisName>(
         device: &mut Device,
-        (codes, grid): &Weights,
-    ) -> Projection<In, Out> {
-        BlockScaled {
-            weight: HostTensor::<f8e4m3, m![Out, In]>::from_vec(codes.clone())
+        banks: &[[Weights; 3]],
+        at: usize,
+    ) -> Bank<In, Out, X> {
+        let codes: Vec<f8e4m3> = banks.iter().flat_map(|b| b[at].0.clone()).collect();
+        let scales: Vec<f32> = (banks.iter())
+            .flat_map(|b| layout::<In, Out>(&b[at].1))
+            .collect();
+        Bank {
+            weight: HostTensor::<f8e4m3, m![X, Out, In]>::from_vec(codes)
                 .to_hbm(&mut device.pdma)
                 .await
                 .unwrap(),
-            weight_scale: HostTensor::<f32, fp8::Scales<In, Out>>::from_vec(layout::<In, Out>(
-                grid,
-            ))
-            .to_hbm(&mut device.pdma)
-            .await
-            .unwrap(),
-            contract: fp8::Block,
-            shape: PhantomData,
+            weight_scale: HostTensor::<f32, m![X, { fp8::Scales<In, Out> }]>::from_vec(scales)
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap(),
         }
     }
 
@@ -200,19 +291,16 @@ pub(crate) mod tests {
     }
 
     /// The experts of `banks` on the device.
-    pub(crate) async fn experts<H: AxisName, I: AxisName, const E: usize>(
+    pub(crate) async fn experts<H: AxisName, I: AxisName, X: AxisName>(
         device: &mut Device,
         banks: &[[Weights; 3]],
-    ) -> [Expert<H, I>; E] {
-        let mut experts = Vec::new();
-        for [gate, up, down] in banks {
-            experts.push(Expert {
-                gate_proj: projection::<H, I>(device, gate).await,
-                up_proj: projection::<H, I>(device, up).await,
-                down_proj: projection::<I, H>(device, down).await,
-            });
+    ) -> Experts<H, I, X> {
+        assert_eq!(banks.len(), X::SIZE);
+        Experts {
+            gate_proj: stacked::<H, I, X>(device, banks, 0).await,
+            up_proj: stacked::<H, I, X>(device, banks, 1).await,
+            down_proj: stacked::<I, H, X>(device, banks, 2).await,
         }
-        experts.try_into().ok().unwrap()
     }
 
     /// Each live row's selection runs through its expert as the reference block linears and a
@@ -224,7 +312,7 @@ pub(crate) mod tests {
         let mut device = Device::new(routed.topology()).unwrap();
         let (w, i) = (Width::SIZE, Inner::SIZE);
         let banks = banks(4, w, i);
-        let experts = experts::<Width, Inner, 4>(&mut device, &banks).await;
+        let experts = experts::<Width, Inner, Four>(&mut device, &banks).await;
         let rows: Vec<bf16> = (0..Eight::SIZE * w)
             .map(|at| bf16::from_f32(((hash(at, 0x77) % 1001) as f32 - 500.0) / 250.0))
             .collect();

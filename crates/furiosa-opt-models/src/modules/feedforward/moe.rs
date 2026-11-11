@@ -12,7 +12,7 @@ use crate::ops::linear::Linear;
 use crate::ops::linear::experts::{Indices, Rows};
 use crate::ops::normalization::{Chunk, FeatureSlices};
 use crate::ops::reduction;
-use crate::ops::swiglu::experts::Expert;
+use crate::ops::swiglu::experts::Experts;
 use crate::tensor::live::Live;
 use crate::tensor::mapping::{BroadcastClusters as Cluster, Rows as Layout};
 use crate::tensor::parallel::{Chip, Parallel, Parallelism};
@@ -482,17 +482,17 @@ fn fold<R: AxisName, K: AxisName, W: AxisName, C: M>(
 /// - A group of at most 256 rows runs at once, as the routing ops take them; the experts run only
 ///   the group's live rows, and the other rows' outputs are unspecified.
 #[derive(DeviceSend, Load)]
-pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName, const E: usize> {
+pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName> {
     /// The router's projection of a row to its experts' logits: `gate.weight`.
     pub gate: Linear<H, X, Chip>,
     /// The ranks the selection breaks ties by, built on host.
     #[load(rename = "")]
     pub select: TopK<X, S>,
     /// The experts, each under its index: `experts.{e}.{gate,up,down}_proj`.
-    pub experts: [Expert<H, I>; E],
+    pub experts: Experts<H, I, X>,
 }
 
-impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName, const E: usize> Sparse<H, I, X, S, E> {
+impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName> Sparse<H, I, X, S> {
     /// The block's output for each of `rows`, its live rows computed.
     pub fn rows<R: AxisName>(
         &self,
@@ -500,7 +500,7 @@ impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName, const E: usize> Sparse<
         rows: &HbmTensor<bf16, Chip, m![R, H]>,
         live: Live<(), R>,
     ) -> HbmTensor<bf16, Chip, m![R, H]> {
-        const { assert!(X::SIZE == E && R::SIZE <= 256) };
+        const { assert!(R::SIZE <= 256) };
         let logits = Op::forward(&self.gate, &mut *device, rows);
         let (indices, probabilities) = self.select.forward(&mut *device, (), &mut (), &logits);
         let probabilities = Normalize.forward(&mut *device, (), &mut (), probabilities);
@@ -1069,7 +1069,7 @@ mod tests {
         /// The test's live rows of its 256, a routing group's.
         const LIVE: usize = 7;
 
-        type Block = Sparse<Width, Inner, Choices, Picked, 128>;
+        type Block = Sparse<Width, Inner, Choices, Picked>;
 
         #[device(chip = 1)]
         fn routed(
@@ -1114,7 +1114,7 @@ mod tests {
                     .await
                     .unwrap(),
                 ),
-                experts: experts::<Width, Inner, 128>(&mut device, &banks).await,
+                experts: experts::<Width, Inner, Choices>(&mut device, &banks).await,
             };
             let input = HostTensor::<bf16, m![Group, Width]>::from_vec(rows.clone())
                 .to_hbm(&mut device.pdma)

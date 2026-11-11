@@ -28,13 +28,15 @@ use std::sync::PoisonError;
 mod llama;
 mod mistral;
 mod qwen3;
+mod qwen3_moe;
 
 /// The submodule of each model type that loads, by family: its name, the function that adds its
 /// classes to it, and its decoder classes by name.
-pub(super) const FAMILIES: [Family; 3] = [
+pub(super) const FAMILIES: [Family; 4] = [
     ("llama", llama::register, llama::CLASSES),
     ("mistral", mistral::register, mistral::CLASSES),
     ("qwen3", qwen3::register, qwen3::CLASSES),
+    ("qwen3_moe", qwen3_moe::register, qwen3_moe::CLASSES),
 ];
 
 type Family = (

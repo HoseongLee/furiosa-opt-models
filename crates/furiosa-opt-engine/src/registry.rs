@@ -14,7 +14,7 @@
 use crate::decoder::{Decoder, Instance, Served};
 use crate::vision_language::Encoder;
 use furiosa_opt_models::load::{Checkpoint, Context, Load, LoadError, Part};
-use furiosa_opt_models::models::decoder::attention::{llama, qwen3};
+use furiosa_opt_models::models::decoder::attention::{llama, qwen3, qwen3_moe};
 use furiosa_opt_models::models::decoder::form;
 use furiosa_opt_models::models::vision_language::gemma4_unified;
 use furiosa_opt_models::models::{Class, Implements};
@@ -408,7 +408,10 @@ pub const ARCHITECTURES: &[(&str, &[Implementation])] = &[
             >(),
         ],
     ),
-    ("Qwen3MoeForCausalLM", &[]),
+    (
+        "Qwen3MoeForCausalLM",
+        &[Implementation::of::<qwen3_moe::fp8::ForCausalLM>()],
+    ),
     ("Qwen3MoeForCausalLMMTP", &[]),
     // Head-free Hugging Face Qwen3 MoE decoder.
     ("Qwen3MoeModel", &[]),
