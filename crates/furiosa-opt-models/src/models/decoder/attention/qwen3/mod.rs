@@ -245,10 +245,10 @@ type RotaryEmbedding<S, C, X> = key_value::Preparation<
 const SCALE: usize = scale(Head::SIZE);
 
 /// The norm of every Qwen3 size: `rms_norm_eps` 1e-6.
-type QwenNorm<W, X> =
+pub(crate) type QwenNorm<W, X> =
     RmsNorm<W, { EPSILON }, m![1], Weight<m![W], m![1], <X as Memory>::Tensor<bf16, m![1], m![W]>>>;
 
-const EPSILON: usize = 1e-6_f32.to_bits() as usize;
+pub(crate) const EPSILON: usize = 1e-6_f32.to_bits() as usize;
 
 impl Geometry for Size<"0.6B"> {
     const SIZE: &'static str = "0.6B";
@@ -435,7 +435,7 @@ where
 
 /// The work a call's host plans for a size of `G` query heads a key and value head, in `WAVES`
 /// wide tiles.
-type Work<G, const WAVES: usize> = paged::Work<Prompts, KvHeads, G, Head, WAVES>;
+pub(crate) type Work<G, const WAVES: usize> = paged::Work<Prompts, KvHeads, G, Head, WAVES>;
 
 // The rotary tiles of a launch's 1024 rows.
 axes![Slots = 8];
@@ -645,7 +645,7 @@ type HeadOf<S> = <S as Geometry>::Head;
 type KvHeadsOf<S> = <S as Geometry>::KvHeads;
 
 /// The norm of each query and key head, its gain replicated over the slices.
-type HeadNorm<S, X> = full::HeadNorm<
+pub(crate) type HeadNorm<S, X> = full::HeadNorm<
     <S as Geometry>::Head,
     Chip,
     Weight<
@@ -656,7 +656,7 @@ type HeadNorm<S, X> = full::HeadNorm<
     F32<EPSILON>,
 >;
 
-type Embed<S, X> = Named<
+pub(crate) type Embed<S, X> = Named<
     "embed_tokens",
     Embedding<
         Vocabulary<S>,
@@ -675,15 +675,15 @@ pub(crate) type QueryNorm<S, X> = <S as Front>::HeadNorm<Named<"q_norm", HeadNor
 pub(crate) type KeyNorm<S, X> = <S as Front>::HeadNorm<Named<"k_norm", HeadNorm<S, X>>>;
 
 /// A catalog layer's query, key and value projections in form `P` and its head norms.
-type Heads<S, P, X> = NormalizedQkv<Qkv<S, P, X>, QueryNorm<S, X>, KeyNorm<S, X>>;
+pub(crate) type Heads<S, P, X> = NormalizedQkv<Qkv<S, P, X>, QueryNorm<S, X>, KeyNorm<S, X>>;
 
-type Qkv<S, P, X> = attention::Projection<
+pub(crate) type Qkv<S, P, X> = attention::Projection<
     Named<"q_proj", <P as Form>::Query<Hidden<S>, QueryHeads<S>, HeadOf<S>, X>>,
     Named<"k_proj", <P as Form>::Key<Hidden<S>, KvHeadsOf<S>, HeadOf<S>, X>>,
     Named<"v_proj", <P as Form>::Value<Hidden<S>, KvHeadsOf<S>, HeadOf<S>, X>>,
 >;
 
-type Attend<S> = full::Attention<
+pub(crate) type Attend<S> = full::Attention<
     PhantomData<(<S as Geometry>::KvHeads, Groups<S>, <S as Geometry>::Head)>,
     F32<SCALE>,
 >;
@@ -744,7 +744,7 @@ pub type CatalogBody<S, P, C, X> = <<S as Geometry>::Layers<()> as Depth<S, P, C
 
 /// The wide tiles of the size `S`'s work: as many as a call of its rows takes when every row
 /// attends the whole context `S` is compiled for, so its call's work holds whatever it admits.
-const fn tiles<S: Geometry + Decode>() -> usize {
+pub(crate) const fn tiles<S: Geometry + Decode>() -> usize {
     paged::Plan::waves::<S::Groups>(S::Rows::SIZE, S::Windows::SIZE * Cache::SIZE)
 }
 

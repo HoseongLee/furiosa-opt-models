@@ -46,6 +46,7 @@ use core::task::Poll;
 use furiosa_opt_std::prelude::*;
 
 mod affine;
+mod moe;
 pub(crate) mod nvfp4;
 
 /// The work between two attentions on one row tile: the end of `A`, then the start of `B`.

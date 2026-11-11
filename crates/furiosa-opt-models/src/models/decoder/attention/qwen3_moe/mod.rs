@@ -6,6 +6,8 @@
 //! - Every size normalizes its queries and keys head by head, over 128-feature heads.
 //! - [`Model`] and [`Body`] are the catalog's composition, over the [`Qwen3Moe`] template.
 
+pub mod fp8;
+
 use crate::models::decoder::attention::{Chunks, Geometry, mixtral::DbrxForCausalLM};
 use crate::models::{Family, config};
 use crate::modules::feedforward::moe::Normalize;

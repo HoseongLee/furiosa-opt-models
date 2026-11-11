@@ -38,6 +38,18 @@ use furiosa_opt_std::prelude::*;
 
 /// The BF16 layer of the size `Z`.
 type Layer<Z> = super::Layer<Affine, Z>;
+/// A BF16 layer of the size `Z` whose attention residual is its catalog layer's, followed by the
+/// feed-forward residual `F`: the catalog layer, or a sparse block's.
+pub(super) type Cut<Z, F> = Sequential<<Layer<Z> as Parts>::First, F>;
+
+/// The two parts of a sequence.
+pub(super) trait Parts {
+    type First;
+}
+
+impl<A, B> Parts for Sequential<A, B> {
+    type First = A;
+}
 /// What a leaf `L` gives when begun for a tile of a launch of the size `Z`.
 type Begun<L, Z> = <L as Module<Begin<()>, Live<(), Capacity<Z>>, &'static mut ()>>::Output;
 type QueryProjection<Z> = <Affine as Form>::Query<Width<Z>, QueryHeads<Z>, Head, Hbm>;
@@ -60,7 +72,7 @@ type Product<Z> = HbmTensor<bf16, Chip, m![Span, { Symbol<<Z as Geometry>::Inter
 /// The forms a layer's input norm, projections and head norms take for a tile's rows, landed: the
 /// norm's gain, the value form, the launch of the tile's rows it stages, the key and query forms
 /// and the two head norms' forms.
-struct Front<G, V, L, K, Q, QN, KN> {
+pub(super) struct Front<G, V, L, K, Q, QN, KN> {
     gain: G,
     value: V,
     launch: L,
@@ -71,7 +83,7 @@ struct Front<G, V, L, K, Q, QN, KN> {
 }
 
 /// A layer's front of the size `Z` landed, its head norms begun as `QN` and `KN`.
-type Landed<Z, QN, KN> = Front<
+pub(super) type Landed<Z, QN, KN> = Front<
     <Stage as crate::Op<&'static Norm<Z>>>::Output,
     Begun<ValueProjection<Z>, Z>,
     Begun<Begun<ValueProjection<Z>, Z>, Z>,
@@ -89,9 +101,9 @@ struct Staged<Z: Geometry + Decode> {
 }
 
 /// `layer`'s front landed for the rows of `tile`.
-fn front<Z, H, const E: usize, const C: usize, const L: usize, QN, KN>(
+pub(super) fn front<Z, H, const E: usize, const C: usize, const L: usize, QN, KN, F>(
     device: &mut Device,
-    layer: &Layer<Z>,
+    layer: &Cut<Z, F>,
     tile: Live<(), Capacity<Z>>,
 ) -> Landed<Z, QN, KN>
 where
@@ -139,10 +151,10 @@ where
 /// A tile's input rows `rows` through `layer` up to its attention's store, its `front` landed: the
 /// input norm, then every period's queries, keys and values, head-normed, rotated and stored in
 /// `stored`; the rows, for the residual.
-fn start<Z, H, const E: usize, const C: usize, const L: usize, QN, KN>(
+pub(super) fn start<Z, H, const E: usize, const C: usize, const L: usize, QN, KN, F>(
     device: &mut Device,
     call: Launched<'_, '_, Z>,
-    layer: &Layer<Z>,
+    layer: &Cut<Z, F>,
     front: Landed<Z, QN, KN>,
     rows: RowTile<Z>,
     stored: &mut Stored<Z>,

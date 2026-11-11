@@ -312,7 +312,7 @@ where
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tensor::parallel::Chip;
     use crate::tests::DEVICE;
@@ -342,7 +342,7 @@ pub(super) mod tests {
     /// `w8a8_triton_block_scaled_mm`): scale `max(amax, 1e-10) * fl(1/448)` per 128 inputs,
     /// saturating E4M3 `x / scale`, each block's FP32 sum times its activation scale then its
     /// `[output / 128, input / 128]` weight scale, blocks added in order.
-    pub(in super::super) fn reference(input: &[bf16], weight: &[f8e4m3], grid: &[f32]) -> Vec<f32> {
+    pub(crate) fn reference(input: &[bf16], weight: &[f8e4m3], grid: &[f32]) -> Vec<f32> {
         let (inputs, groups) = (input.len(), input.len() / GROUP);
         let (quantized, scales): (Vec<Vec<f32>>, Vec<f32>) = input
             .chunks_exact(GROUP)
@@ -409,7 +409,7 @@ pub(super) mod tests {
     }
 
     /// A hash of `index` under `seed`, for deterministic test values.
-    pub(in super::super) fn hash(index: usize, seed: u32) -> u32 {
+    pub(crate) fn hash(index: usize, seed: u32) -> u32 {
         (index as u32 ^ seed)
             .wrapping_mul(0x9e37_79b9)
             .rotate_left(13)

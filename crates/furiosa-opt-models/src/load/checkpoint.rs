@@ -310,6 +310,21 @@ impl Checkpoint {
         Ok(())
     }
 
+    /// The same config and tensors but those `dropped` names, which a load derives its own in place
+    /// of; the tensors' bytes are shared, not copied.
+    pub(crate) fn without(&self, dropped: impl Fn(&str) -> bool) -> Self {
+        let kept = self.tensors.iter().filter(|(name, _)| !dropped(name));
+        Self {
+            config: self.config.clone(),
+            tensors: kept
+                .map(|(name, stored)| (name.clone(), stored.clone()))
+                .collect(),
+            directory: self.directory.clone(),
+            quantization: self.quantization,
+            part: self.part,
+        }
+    }
+
     /// Removes the tensor `name`; whether the checkpoint held it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn remove(&mut self, name: &str) -> bool {

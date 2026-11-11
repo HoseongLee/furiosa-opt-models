@@ -523,4 +523,4 @@ mod tests {
     }
 }
 
-mod block;
+pub(crate) mod block;

@@ -6,15 +6,18 @@
 //! - Probabilities and the weighted sums are FP32, a sum in choice order; a BF16 sum rounds once.
 //! - Every op is generic over the chips its tensors lie on, each chip routing its own rows.
 
-use crate::Module;
 use crate::load::{Checkpoint, Context, Load, LoadError};
 use crate::ops::collective::AllReduce;
+use crate::ops::linear::Linear;
 use crate::ops::linear::experts::{Indices, Rows};
 use crate::ops::normalization::{Chunk, FeatureSlices};
 use crate::ops::reduction;
+use crate::ops::swiglu::experts::Expert;
+use crate::tensor::live::Live;
 use crate::tensor::mapping::{BroadcastClusters as Cluster, Rows as Layout};
 use crate::tensor::parallel::{Chip, Parallel, Parallelism};
 use crate::tensor::scalar;
+use crate::{Module, Op};
 use furiosa_opt_std::prelude::*;
 use std::marker::PhantomData;
 
@@ -469,6 +472,41 @@ fn fold<R: AxisName, K: AxisName, W: AxisName, C: M>(
         .commit_trim::<m![W % 8]>()
         .commit();
     rounded.to_hbm(&mut device.tdma)
+}
+
+/// A sparse MoE block over rows in HBM, Qwen3 MoE's: the router's BF16 `gate` projects each row to
+/// its logits over `X` experts, the `S` most probable are selected and their probabilities
+/// renormalized to one, each selection runs through its block-scaled E4M3 SwiGLU expert, and the
+/// selections are summed weighted by their probabilities, in FP32 in choice order.
+///
+/// - A group of at most 256 rows runs at once, as the routing ops take them; the experts run only
+///   the group's live rows, and the other rows' outputs are unspecified.
+#[derive(DeviceSend, Load)]
+pub struct Sparse<H: AxisName, I: AxisName, X: AxisName, S: AxisName, const E: usize> {
+    /// The router's projection of a row to its experts' logits: `gate.weight`.
+    pub gate: Linear<H, X, Chip>,
+    /// The ranks the selection breaks ties by, built on host.
+    #[load(rename = "")]
+    pub select: TopK<X, S>,
+    /// The experts, each under its index: `experts.{e}.{gate,up,down}_proj`.
+    pub experts: [Expert<H, I>; E],
+}
+
+impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName, const E: usize> Sparse<H, I, X, S, E> {
+    /// The block's output for each of `rows`, its live rows computed.
+    pub fn rows<R: AxisName>(
+        &self,
+        device: &mut Device,
+        rows: &HbmTensor<bf16, Chip, m![R, H]>,
+        live: Live<(), R>,
+    ) -> HbmTensor<bf16, Chip, m![R, H]> {
+        const { assert!(X::SIZE == E && R::SIZE <= 256) };
+        let logits = Op::forward(&self.gate, &mut *device, rows);
+        let (indices, probabilities) = self.select.forward(&mut *device, (), &mut (), &logits);
+        let probabilities = Normalize.forward(&mut *device, (), &mut (), probabilities);
+        let routed = Op::forward(&self.experts, &mut *device, (rows, &indices, live));
+        Reduce::<Parallel<1>>::default().forward(device, (), &mut (), (&routed, &probabilities))
+    }
 }
 
 #[cfg(test)]
@@ -1007,6 +1045,124 @@ mod tests {
                 "chip {chip}: {} sums differ, first {first:?}",
                 differ.len()
             );
+        }
+    }
+
+    mod sparse {
+        use super::super::Sparse;
+        use crate::ops::swiglu::experts::tests::{banks, experts, oracle};
+        use crate::tensor::live::Live;
+        use crate::tensor::parallel::Chip;
+        use crate::tensor::scalar::Value;
+        use crate::tests::DEVICE;
+        use furiosa_opt_std::prelude::*;
+        use furiosa_opt_std::runtime::launch;
+
+        axes![
+            Width = 512,
+            Inner = 256,
+            Choices = 128,
+            Picked = 8,
+            Group = 256
+        ];
+
+        /// The test's live rows of its 256, a routing group's.
+        const LIVE: usize = 7;
+
+        type Block = Sparse<Width, Inner, Choices, Picked, 128>;
+
+        #[device(chip = 1)]
+        fn routed(
+            device: &mut Device,
+            block: &Block,
+            rows: &HbmTensor<bf16, Chip, m![Group, Width]>,
+            count: &Value<Chip>,
+        ) -> HbmTensor<bf16, Chip, m![Group, Width]> {
+            let live = Live::<(), Group>::read(count);
+            block.rows(device, rows, live)
+        }
+
+        /// Each live row is the sum of its eight most probable experts' outputs weighted by their
+        /// renormalized probabilities, as a host reference of the router, the experts and the sum
+        /// gives it, to a step of the output's rounding.
+        #[tokio::test(flavor = "current_thread")]
+        async fn routes_each_live_row_through_its_selected_experts() {
+            let _lease = DEVICE.lock().await;
+            let mut device = Device::new(routed.topology()).unwrap();
+            let (w, i, x) = (Width::SIZE, Inner::SIZE, Choices::SIZE);
+            let value = |at: usize, seed: u32, scale: f32| {
+                let bits = crate::ops::linear::fp8::block::tests::hash(at, seed);
+                bf16::from_f32(((bits % 2001) as f32 - 1000.0) / 1000.0 * scale)
+            };
+            let gate: Vec<bf16> = (0..x * w).map(|at| value(at, 0x91, 0.2)).collect();
+            let rows: Vec<bf16> = (0..Group::SIZE * w)
+                .map(|at| value(at, 0x92, 2.0))
+                .collect();
+            let banks = banks(x as u32, w, i);
+            let block = Block {
+                gate: crate::ops::linear::Linear::new(crate::tensor::form::Weight::new(
+                    HostTensor::<bf16, m![Choices, Width]>::from_vec(gate.clone())
+                        .to_hbm(&mut device.pdma)
+                        .await
+                        .unwrap(),
+                )),
+                select: super::super::TopK::new(
+                    HostTensor::<i32, m![Choices]>::from_vec(
+                        (0..x as i32).rev().collect::<Vec<_>>(),
+                    )
+                    .to_hbm(&mut device.pdma)
+                    .await
+                    .unwrap(),
+                ),
+                experts: experts::<Width, Inner, 128>(&mut device, &banks).await,
+            };
+            let input = HostTensor::<bf16, m![Group, Width]>::from_vec(rows.clone())
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let count = HostTensor::<i32, m![1]>::from_vec(vec![LIVE as i32])
+                .to_hbm(&mut device.pdma)
+                .await
+                .unwrap();
+            let output = launch(routed, (&mut device, &block, &input, &count))
+                .await
+                .unwrap()
+                .to_host::<m![Group, Width]>(&mut device.pdma)
+                .await
+                .unwrap()
+                .into_vec();
+            for r in 0..LIVE {
+                let row = &rows[r * w..][..w];
+                let logits: Vec<f32> = (0..x)
+                    .map(|e| {
+                        let sum: f32 = (0..w)
+                            .map(|h| gate[e * w + h].to_f32() * row[h].to_f32())
+                            .sum();
+                        bf16::from_f32(sum).to_f32()
+                    })
+                    .collect();
+                let top = logits.iter().cloned().fold(f32::MIN, f32::max);
+                let exps: Vec<f32> = logits.iter().map(|l| (l - top).exp()).collect();
+                let mut order: Vec<usize> = (0..x).collect();
+                order.sort_by(|&a, &b| exps[b].total_cmp(&exps[a]).then(a.cmp(&b)));
+                let picked = &order[..Picked::SIZE];
+                let total: f32 = picked.iter().map(|&e| exps[e]).sum();
+                let mut want = vec![0f32; w];
+                for &e in picked {
+                    let selection = oracle(row, &banks[e]);
+                    for (sum, v) in want.iter_mut().zip(selection) {
+                        *sum += exps[e] / total * bf16::from_f32(v).to_f32();
+                    }
+                }
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+                for (o, (got, want)) in output[r * w..][..w].iter().zip(&want).enumerate() {
+                    let error = (got.to_f32() - want).abs();
+                    assert!(
+                        error <= scale * 2f32.powi(-6),
+                        "row {r} output {o}: {got:?} vs {want} (experts {picked:?})"
+                    );
+                }
+            }
         }
     }
 }
