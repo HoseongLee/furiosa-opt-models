@@ -474,6 +474,21 @@ fn fold<R: AxisName, K: AxisName, W: AxisName, C: M>(
     rounded.to_hbm(&mut device.tdma)
 }
 
+/// The rows the block's selections fold at once.
+type Lanes = crate::tensor::axis::Eight;
+
+/// The groups of [`Lanes`] rows of `R` rows.
+#[derive(Clone, Debug)]
+struct LaneGroups<R>(PhantomData<R>);
+
+impl<R: AxisName> AxisName for LaneGroups<R> {
+    const NAME: Ident = Ident::new("LaneGroups");
+    const SIZE: usize = {
+        assert!(R::SIZE.is_multiple_of(Lanes::SIZE));
+        R::SIZE / Lanes::SIZE
+    };
+}
+
 /// A sparse MoE block over rows in HBM, Qwen3 MoE's: the router's BF16 `gate` projects each row to
 /// its logits over `X` experts, the `S` most probable are selected and their probabilities
 /// renormalized to one, each selection runs through its block-scaled E4M3 SwiGLU expert, and the
@@ -505,7 +520,41 @@ impl<H: AxisName, I: AxisName, X: AxisName, S: AxisName> Sparse<H, I, X, S> {
         let (indices, probabilities) = self.select.forward(&mut *device, (), &mut (), &logits);
         let probabilities = Normalize.forward(&mut *device, (), &mut (), probabilities);
         let routed = Op::forward(&self.experts, &mut *device, (rows, &indices, live));
-        Reduce::<Parallel<1>>::default().forward(device, (), &mut (), (&routed, &probabilities))
+        // The live rows' sums, eight rows at a time: a fold of every row reads all of them.
+        // SAFETY: the rows in order are their groups' rows in order.
+        let (routed, probabilities) = unsafe {
+            (
+                routed.reshape::<Chip, m![{ Symbol<LaneGroups<R>> }, Lanes, S, H]>(),
+                probabilities.reshape::<Chip, m![{ Symbol<LaneGroups<R>> }, Lanes, S, 1 # 2]>(),
+            )
+        };
+        let mut output = HbmTensor::<bf16, Chip, m![{ Symbol<LaneGroups<R>> }, Lanes, H]>::new();
+        let (first, groups) = live.groups::<Lanes>();
+        for group in first..first + groups {
+            let mut selected = HbmTensor::<bf16, Chip, m![Lanes, S, H]>::new();
+            let mut weights = HbmTensor::<f32, Chip, m![Lanes, S, 1 # 2]>::new();
+            routed
+                .view()
+                .tile::<m![{ Symbol<LaneGroups<R>> }], 1, m![{ Symbol<LaneGroups<R>> } = 1 # ({ Symbol<LaneGroups<R>> }), Lanes, S, H]>(group)
+                .to_hbm_view(&mut device.tdma, selected.view_mut());
+            probabilities
+                .view()
+                .tile::<m![{ Symbol<LaneGroups<R>> }], 1, m![{ Symbol<LaneGroups<R>> } = 1 # ({ Symbol<LaneGroups<R>> }), Lanes, S, 1 # 2]>(group)
+                .to_hbm_view(&mut device.tdma, weights.view_mut());
+            let sums = Reduce::<Parallel<1>>::default().forward(
+                &mut *device,
+                (),
+                &mut (),
+                (&selected, &weights),
+            );
+            let into = output
+                .view_mut()
+                .tile::<m![{ Symbol<LaneGroups<R>> }], 1, m![{ Symbol<LaneGroups<R>> } = 1 #{!} ({ Symbol<LaneGroups<R>> }), Lanes, H]>(group);
+            sums.view().to_hbm_view(&mut device.tdma, into);
+        }
+        // SAFETY: as above, the groups' rows in order are the rows.
+        let output: HbmTensor<bf16, Chip, m![R, H]> = unsafe { output.reshape() };
+        output
     }
 }
 
